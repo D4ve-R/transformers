@@ -1,6 +1,6 @@
 
 """ SincNet model """
-from math import pi
+from functools import lru_cache
 import numpy as np
 
 import torch
@@ -9,9 +9,20 @@ import torch.nn.functional as F
 
 from .configuration_sincnet import SincNetConfig
 from ...modeling_utils import PreTrainedModel
+from ...modeling_outputs import BaseModelOutput
+from ...utils import (
+    add_code_sample_docstrings,
+    add_start_docstrings,
+    add_start_docstrings_to_model_forward,
+    logging,
+)
+
+logger = logging.get_logger(__name__)
 
 # General docstring
 _CONFIG_FOR_DOC = "SincNetConfig"
+_CHECKPOINT_FOR_DOC = "sincnet-base-16kHz" # TODO: add checkpoint
+_EXPECTED_OUTPUT_SHAPE = [1, 50, 512] # TODO: add expected output shape
 
 SINCNET_PRETRAINED_MODEL_ARCHIVE_LIST = [
     # See all SincNet models at https://huggingface.co/models?filter=sincnet
@@ -19,10 +30,11 @@ SINCNET_PRETRAINED_MODEL_ARCHIVE_LIST = [
 
 # https://github.com/mravanelli/SincNet/blob/master/dnn_models.py
 class SincNetFilterConvLayer(nn.Module):
-    """Sinc fast convolution"""
+    """SincNet fast convolution filter layer"""
 
     def __init__(self, out_channels: int, kernel_size: int, sample_rate=16000, 
-                stride=1, padding=0, dilation=1, min_low_hz=50, min_band_hz=50, in_channels=1):
+                stride=1, padding=0, dilation=1, min_low_hz=50, min_band_hz=50, 
+                in_channels=1, requires_grad=False):
         """
         Args:
             out_channels : `int` number of filters.
@@ -32,42 +44,65 @@ class SincNetFilterConvLayer(nn.Module):
         super(SincNetFilterConvLayer, self).__init__()
 
         if in_channels != 1:
-            raise ValueError(f"SincConv only support one input channel (here, in_channels = {in_channels})")
+            raise ValueError(f"SincNetFilterConvLayer only support in_channels = 1, was in_channels = {in_channels}")
 
-        self.out_channels = out_channels
-        self.kernel_size = kernel_size
+        self._out_channels = out_channels
+        self._kernel_size = kernel_size
 
         if kernel_size % 2 == 0:
-            # Forcing the filters to be odd (i.e, perfectly symmetrics)
-            self.kernel_size += 1
+            self._kernel_size += 1 # Forcing the filters to be odd
             
-        self.stride = stride
-        self.padding = padding
-        self.dilation = dilation
-        self.sample_rate = sample_rate
-        self.min_low_hz = min_low_hz
-        self.min_band_hz = min_band_hz
+        self._stride = stride
+        self._padding = padding
+        self._dilation = dilation
+        self._sample_rate = sample_rate
+        self._min_low_hz = min_low_hz
+        self._min_band_hz = min_band_hz
 
         # initialize filterbanks such that they are equally spaced in Mel scale
         low_hz = 30
-        high_hz = self.sample_rate / 2 - (self.min_low_hz + self.min_band_hz)
-
+        high_hz = self._sample_rate / 2 - (self._min_low_hz + self._min_band_hz)
         mel = np.linspace(
-            2595 * np.log10(1 + low_hz / 700),
-            2595 * np.log10(1 + high_hz / 700),
-            self.out_channels + 1
+            2595 * np.log10(1 + low_hz / 700), # Convert Hz to Mel
+            2595 * np.log10(1 + high_hz / 700), # Convert Hz to Mel
+            self._out_channels + 1
         )
-        hz = 700 * (10 ** (mel / 2595) - 1)
+        hz = 700 * (10 ** (mel / 2595) - 1) # Convert Mel to Hz
         
-        self.low_hz_ = nn.Parameter(torch.Tensor(hz[:-1]).view(-1, 1)) # filter lower frequency (out_channels, 1)
-        self.band_hz_ = nn.Parameter(torch.Tensor(np.diff(hz)).view(-1, 1)) # filter frequency band (out_channels, 1)
+        self._low_hz = nn.Parameter(
+            torch.Tensor(hz[:-1]).view(-1, 1),
+            requires_grad=requires_grad
+        )
+        self._band_hz = nn.Parameter(
+            torch.Tensor(np.diff(hz)).view(-1, 1),
+            requires_grad=requires_grad
+        )
+        self.register_buffer(
+            "_window", 
+            torch.from_numpy(np.hamming(self._kernel_size)[: self._kernel_size // 2]).float()
+        )
+        self.register_buffer(
+            "_n",
+            (2* np.pi * torch.arange(-(self._kernel_size // 2), 0.0).view(1, -1) / self._sample_rate)
+        )
 
-        n_lin = torch.linspace(0, (self.kernel_size/2)-1, steps=int((self.kernel_size/2))) # computing only half of the window
-        self.window_ = nn.Parameter(0.54 - 0.46 * torch.cos(2*pi*n_lin/self.kernel_size))
+    @property
+    @lru_cache(maxsize=1)
+    def filters(self) -> torch.Tensor:
+        low = self._min_low_hz + torch.abs(self._low_hz)
+        high = torch.clamp(low + self._min_band_hz + torch.abs(self._band_hz), self._min_low_hz, self._sample_rate/2)
+        band = (high-low)[:,0]
 
-        # (1, kernel_size/2)
-        n = (self.kernel_size - 1) / 2.0
-        self.n_ = nn.Parameter(2*pi * torch.arange(-n, 0).view(1, -1) / self.sample_rate) # Due to symmetry, I only need half of the time axes
+        f_times_t_low = torch.matmul(low, self._n)
+        f_times_t_high = torch.matmul(high, self._n)
+
+        band_pass_left = ((torch.sin(f_times_t_high)-torch.sin(f_times_t_low))/(self._n/2))*self._window
+        band_pass_center = 2 * band.view(-1, 1)
+        band_pass_right = torch.flip(band_pass_left, dims=[1])
+
+        band_pass = torch.cat([band_pass_left,band_pass_center,band_pass_right],dim=1)
+        band_pass = band_pass / (2*band[:,None])
+        return band_pass.view(self._out_channels, 1, self._kernel_size)
 
     def forward(self, waveforms: torch.Tensor) -> torch.Tensor:
         """
@@ -77,31 +112,10 @@ class SincNetFilterConvLayer(nn.Module):
         Returns:
             features : (batch_size, out_channels, n_samples_out) batch of sinc filters activations.
         """
-        self.n_ = self.n_.to(waveforms.device)
-        self.window_ = self.window_.to(waveforms.device)
-
-        low = self.min_low_hz + torch.abs(self.low_hz_)
-        high = torch.clamp(low + self.min_band_hz + torch.abs(self.band_hz_),self.min_low_hz,self.sample_rate/2)
-        band = (high-low)[:,0]
-        
-        f_times_t_low = torch.matmul(low, self.n_)
-        f_times_t_high = torch.matmul(high, self.n_)
-
-        band_pass_left = ((torch.sin(f_times_t_high)-torch.sin(f_times_t_low))/(self.n_/2))*self.window_ # Equivalent of Eq.4 of the reference paper (SPEAKER RECOGNITION FROM RAW WAVEFORM WITH SINCNET). I just have expanded the sinc and simplified the terms. This way I avoid several useless computations. 
-        band_pass_center = 2 * band.view(-1, 1)
-        band_pass_right = torch.flip(band_pass_left, dims=[1])    
-        
-        band_pass = torch.cat([band_pass_left,band_pass_center,band_pass_right],dim=1)
-        band_pass = band_pass / (2*band[:,None])
-        
-        self.filters = (band_pass).view(
-            self.out_channels, 1, self.kernel_size)
-
-        return F.conv1d(waveforms, self.filters, stride=self.stride,
-                        padding=self.padding, dilation=self.dilation,
+        return F.conv1d(waveforms, self.filters, stride=self._stride,
+                        padding=self._padding, dilation=self._dilation,
         ).abs_() # https://github.com/mravanelli/SincNet/issues/4
 
-# https://github.com/pyannote/pyannote-audio/blob/develop/pyannote/audio/models/blocks/sincnet.py
 class SincNet(nn.Module):
     """SincNet"""
 
@@ -114,19 +128,35 @@ class SincNet(nn.Module):
         pool_kernel_size: int = 3,
         pool_stride: int = 3,
         sample_rate: int = 16000,
-        stride: int = 10,
+        sinc_filter_stride: int = 10,
+        sinc_filter_padding: int = 0,
+        sinc_filter_dilation: int = 1,
+        min_low_hz: int = 50,
+        min_band_hz: int = 50,
+        sinc_filter_in_channels: int = 1,
+        num_wavform_channels: int = 1,
     ):
         super().__init__()
 
         if sample_rate != 16000:
-            raise NotImplementedError("SincNet only supports 16kHz audio for now.")
-            # TODO: add support for other sample rate. it should be enough to multiply
-            # sinc_filter_length by (sample_rate / 16000). but this needs to be double-checked.
+            raise NotImplementedError(f"SincNet only supports 16kHz audio (sample_rate = 16000), was sample_rate = {sample_rate}")
 
-        self.wav_norm1d = nn.InstanceNorm1d(1, affine=True)
+        self.wav_norm1d = nn.InstanceNorm1d(num_wavform_channels, affine=True)
+
+        self.filter = SincNetFilterConvLayer(
+            num_sinc_filters, 
+            sinc_filter_length, 
+            sample_rate=sample_rate, 
+            stride=sinc_filter_stride,
+            padding=sinc_filter_padding,
+            dilation=sinc_filter_dilation,
+            min_low_hz=min_low_hz,
+            min_band_hz=min_band_hz,
+            in_channels=sinc_filter_in_channels,
+        )
 
         self.conv1d = nn.ModuleList([
-            SincNetFilterConvLayer(num_sinc_filters, sinc_filter_length, sample_rate=sample_rate, stride=stride),
+            self.filter,
             nn.Conv1d(num_sinc_filters, num_conv_filters, conv_filter_length),
             nn.Conv1d(num_conv_filters, num_conv_filters, conv_filter_length),
         ])
@@ -144,7 +174,7 @@ class SincNet(nn.Module):
     def forward(self, waveforms: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            waveforms : (batch, channel, sample_rate)
+            waveforms : (batch, channel, sample)
         """
         outputs = self.wav_norm1d(waveforms)
 
@@ -156,6 +186,30 @@ class SincNet(nn.Module):
 
         return outputs
 
+SINCNET_START_DOCSTRING = r"""
+    This model is a PyTorch [torch.nn.Module](https://pytorch.org/docs/stable/nn.html#torch.nn.Module) sub-class. Use
+    it as a regular PyTorch Module and refer to the PyTorch documentation for all matter related to general usage and
+    behavior.
+
+    Parameters:
+        config ([`~SincNetConfig`]): Model configuration class with all the parameters of the model.
+            Initializing with a config file does not load the weights associated with the model, only the
+            configuration. Check out the [`~PreTrainedModel.from_pretrained`] method to load the model weights.
+"""
+
+SINCNET_INPUTS_DOCSTRING = r"""
+    Args:
+        waveforms (:obj:`torch.Tensor` of shape :obj:`(batch_size, channels, sample)`):
+            The waveform data to feed into the model. Each waveform should be a 1D tensor of shape `(n_samples,)`.
+            The model expects the waveform data to be in the range [-1, 1].
+"""
+
+@add_start_docstrings(
+    """
+    SincNet Model process raw audio waveforms to extract features.
+    """,
+    SINCNET_START_DOCSTRING,
+)
 class SincNetModel(PreTrainedModel):
     config_class = SincNetConfig
     base_model_prefix = "sincnet"
@@ -174,5 +228,20 @@ class SincNetModel(PreTrainedModel):
             sample_rate=config.sample_rate,
         )
     
+    @add_start_docstrings_to_model_forward(SINCNET_INPUTS_DOCSTRING.format("(batch_size, channels, sample)"))
+    @add_code_sample_docstrings(
+        checkpoint=_CHECKPOINT_FOR_DOC,
+        output_type=BaseModelOutput,
+        config_class=_CONFIG_FOR_DOC,
+        modality="audio",
+        expected_output=_EXPECTED_OUTPUT_SHAPE,
+    )
     def forward(self, waveforms: torch.Tensor) -> torch.Tensor:
         return self.model(waveforms)
+    
+if __name__ == "__main__":
+    # Test SincNet
+    model = SincNet()
+    waveforms = torch.randn(1, 1, 16000)
+    outputs = model(waveforms)
+    print(outputs.shape) # torch.Size([1, 60, 166])
